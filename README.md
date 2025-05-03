@@ -41,8 +41,8 @@
 ## Installation
 
 ```bash
-git clone https://github.com/yourusername/cynthetika-dbg.git
-cd cynthetika-dbg
+git clone https://github.com/w0lfgirl/cynthetika.git
+cd cynthetika
 ```
 
 ---
@@ -51,7 +51,7 @@ cd cynthetika-dbg
 
 ### 1. Scan for Python Processes
 ```bash
-python cynthetika_dbg.py -scan
+python cynthetika.py -scan
 ```
 Example output:
 ```
@@ -63,7 +63,7 @@ PID        Filename
 
 ### 2. Attach to a Process
 ```bash
-python cynthetika_dbg.py -dbg 1234
+python cynthetika.py -dbg 1234
 ```
 You’ll enter an interactive shell:
 ```
