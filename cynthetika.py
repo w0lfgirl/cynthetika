@@ -1,69 +1,194 @@
-import os
-import shlex
+import socket
 import subprocess
 import sys
+import os
+import tempfile
+import time
+import shlex
+
+SERVER_CODE = """
+import sys
+import inspect
+from tree_format import format_tree
+import socket
+import threading
+import marshal
+from dis import dis
+from types import ModuleType
+import importlib._bootstrap_external
+
+__cynthetika_server__ = True
+
+class __CyNode:
+    __cynthetika__ = True
+    
+    def __init__(self, name, children=None):
+        self.name = name
+        self.children = children or []
+
+    def get_children(self):
+        return self.children
+
+def __cy_load_module_contents():
+    module_globals = globals()
+    current_module_name = __name__
+    
+    def is_server_item(obj):
+        return (hasattr(obj, '__cynthetika__') or \
+               any(name.startswith('__cy') for name in getattr(obj, '__qualname__', '').split('.')))
+    
+    return {
+        'classes': {name: obj for name, obj in module_globals.items()
+                   if inspect.isclass(obj) 
+                   and obj.__module__ == current_module_name
+                   and not is_server_item(obj)},
+        
+        'functions': {name: obj for name, obj in module_globals.items()
+                     if inspect.isfunction(obj)
+                     and obj.__module__ == current_module_name
+                     and not is_server_item(obj)},
+        
+        'variables': {name: obj for name, obj in module_globals.items()
+                     if not name.startswith('__cy')
+                     and not name.startswith('__cynthetika')
+                     and not inspect.isclass(obj)
+                     and not inspect.isfunction(obj)
+                     and not is_server_item(obj)}
+    }
+
+def __cy_handle_client(conn):
+    with conn:
+        data = conn.recv(1024).decode()
+        parts = data.split(':', 1)
+        if len(parts) != 2:
+            return
+        cmd, payload = parts
+        
+        output = ''
+        try:
+            if cmd == 'dump':
+                obj = eval(payload)
+                code_obj = obj.__code__
+                pyc_header = importlib._bootstrap_external._code_to_timestamp_pyc(code_obj)
+                with open(f"{payload}.pyc", "wb") as f:
+                    f.write(pyc_header)
+                    f.write(marshal.dumps(code_obj))
+                output = f"Bytecode dumped to {payload}.pyc"
+            
+            elif cmd == 'dis':
+                obj = eval(payload)
+                code_obj = obj.__code__ if inspect.ismethod(obj) or inspect.isfunction(obj) else None
+                if code_obj:
+                    import io
+                    buf = io.StringIO()
+                    sys.stdout = buf
+                    dis(code_obj)
+                    sys.stdout = sys.__stdout__
+                    output = buf.getvalue()
+            
+            elif cmd == 'structure':
+                contents = __cy_load_module_contents()
+                root = __CyNode("Module")
+                for cls_name, cls in contents['classes'].items():
+                    class_node = __CyNode(cls_name)
+                    for name, _ in inspect.getmembers(cls, inspect.isfunction):
+                        class_node.children.append(__CyNode(name))
+                    root.children.append(class_node)
+                for func_name in contents['functions']:
+                    root.children.append(__CyNode(func_name))
+                for var_name in contents['variables']:
+                    root.children.append(__CyNode(f"{var_name} (variable)"))
+                output = format_tree(root, lambda x: x.name, lambda x: x.get_children())
+            
+            elif cmd == 'getvar':
+                contents = __cy_load_module_contents()
+                var_value = contents['variables'].get(payload)
+                if var_value is not None:
+                    output = f"{payload}:\\n  Type: {type(var_value).__name__}\\n  Value: {repr(var_value)}"
+                else:
+                    output = f"Variable '{payload}' not found"
+            
+            elif cmd == 'exec':
+                exec(payload, globals())
+                output = "Code executed successfully"
+            
+            elif cmd == 'typevars':
+                contents = __cy_load_module_contents()
+                var_type = payload
+                target_type = getattr(__builtins__, var_type, None)
+                if not target_type:
+                    output = f"Error: Type '{var_type}' is not a valid built-in type."
+                else:
+                    found = False
+                    output_lines = [f"Variables of type {var_type} in module:"]
+                    for var_name, var_value in contents['variables'].items():
+                        if isinstance(var_value, target_type):
+                            output_lines.append(f"{var_name}:")
+                            output_lines.append(f"  Type: {type(var_value).__name__}")
+                            output_lines.append(f"  Value: {repr(var_value)}")
+                            found = True
+                    if not found:
+                        output_lines.append(f"No variables of type {var_type} found.")
+                    output = "\\n".join(output_lines)
+            
+            elif cmd == 'searchattr':
+                if "." not in payload:
+                    output = "Invalid format. Use 'ClassName.attribute'"
+                else:
+                    cls_name, attr = payload.split(".", 1)
+                    contents = __cy_load_module_contents()
+                    cls = contents['classes'].get(cls_name)
+                    if not cls:
+                        output = f"Class '{cls_name}' not found"
+                    else:
+                        try:
+                            instance = cls()
+                            attr_value = getattr(instance, attr, 'Not found')
+                            output = f"Attributes of {cls_name}:\\nInstance __dict__: {instance.__dict__}\\nAttribute value: {attr_value}"
+                        except Exception as e:
+                            output = f"Inspection error: {e}"
+            
+        except Exception as e:
+            output = f"Error: {str(e)}"
+        
+        conn.sendall(output.encode())
+
+def __cy_start_server():
+    with socket.socket() as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(('localhost', 2804))
+        s.listen()
+        while True:
+            conn, _ = s.accept()
+            threading.Thread(target=__cy_handle_client, args=(conn,), name="__cynthetika_client_thread").start()
+
+__cy_server_thread = threading.Thread(
+    target=__cy_start_server,
+    name="__cynthetika_server",
+    daemon=True
+)
+__cy_server_thread.start()
+"""
 
 help_text = {
-    "objects": "Display the structure of objects in the process memory. Usage: 'objects'",
-    "dump": "Dump the bytecode of a specified object. Usage: 'dump <object_name>'",
-    "dis": "Disassemble the bytecode of a specified object. Usage: 'dis <object_name>'",
-    "get": "Get the value of a specific variable. Usage: 'get <variable_name>'",
-    "get-all": "Get all variables in the current scope. Usage: 'get-all'",
-    "search": "Search for objects or variables in memory. Usage: 'search <query>'",
-    "rrun": "Inject and run code in the target process. Usage: 'rrun <code>'",
-    "help": "Display this help message. Usage: 'help'",
-    "exit": "Exit the interactive shell. Usage: 'exit'",
+    "objects": "Display module structure. Usage: 'objects'",
+    "dump": "Dump object bytecode. Usage: 'dump <object>'",
+    "dis": "Disassemble object. Usage: 'dis <function>'",
+    "get": "Get variable. Usage: 'get <variable>'",
+    "typevars": "Find vars by type. Usage: 'typevars <type>'",
+    "search": "Inspect class attributes. Usage: 'search <Class.attr>'",
+    "rrun": "Execute code. Usage: 'rrun <file.py>'",
+    "help": "Show help",
+    "exit": "Exit debugger",
 }
 
 HELPER = "\n".join([f"{cmd}: {desc}" for cmd, desc in help_text.items()])
 
-LOAD_STRUCTURE_CODE = """
-import inspect
-import sys
-from typing import Dict, List, Optional
-from tree_format import format_tree
-
-
-def load_module_contents() -> Dict[str, Dict]:
-    module_globals = globals()
-    current_module_name = __name__
-
-    classes = {}
-    functions = {}
-    variables = {}
-
-    for name, obj in module_globals.items():
-        if name.startswith("__"):
-            continue
-
-        if inspect.isclass(obj):
-            if getattr(obj, "__module__", None) == current_module_name:
-                classes[name] = obj
-        elif inspect.isfunction(obj):
-            if (
-                getattr(obj, "__module__", None) == current_module_name
-                and obj.__qualname__ == name
-            ):
-                functions[name] = obj
-        else:
-            variables[name] = obj
-
-    return {"classes": classes, "functions": functions, "variables": variables}
-
-
-class Node:
-
-    def __init__(self, name: str, children: Optional[List["Node"]] = None):
-        self.name = name
-        self.children = children or []
-
-    def get_children(self) -> List["Node"]:
-        return self.children"""
-
-
-def inject(pid, filename, verbose=False, gdb_prefix=""):
+def inject_server(pid, verbose=False, gdb_prefix=""):
     """Executes a file in a running Python process."""
-    filename = os.path.abspath(filename)
+    with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".py") as f:
+        f.write(SERVER_CODE)
+    filename = os.path.abspath(f.name)
     gdb_cmds = [
         "PyGILState_Ensure()",
         'PyRun_SimpleString("'
@@ -90,102 +215,29 @@ def inject(pid, filename, verbose=False, gdb_prefix=""):
     )
     out, err = p.communicate()
     if verbose:
-        print(out)
-        print(err)
+        print(out.decode())
+        print(err.decode())
 
-
-def dump_bytecode(pid, item) -> None:
-    """Dump bytecode for functions or methods."""
+def check_port():
+    """Check if server is running"""
     try:
-        code = f"""
-import importlib._bootstrap_external, marshal
-code_obj = {item}.__code__
-pyc_header = importlib._bootstrap_external._code_to_timestamp_pyc(code_obj, 0)
-with open("{item}.pyc", "wb") as f:
-    f.write(pyc_header)
-    f.write(marshal.dumps(code_obj))"""
-        with open("_temp.py", "w", encoding="utf-8") as f:
-            f.write(code)
-        inject(pid, "_temp.py")
-        os.remove("_temp.py")
-    except Exception as e:
-        print(f"Error dumping {item}: {e}")
+        with socket.socket() as s:
+            s.settimeout(1)
+            s.connect(('localhost', 2804))
+            return True
+    except:
+        return False
 
-
-def dis_bytecode(pid, item) -> None:
-    """Dump bytecode for functions or methods."""
+def send_command(cmd, payload=""):
+    """Send command to debug server"""
     try:
-        code = f"""__import__('dis').dis({item}.__code__)"""
-        with open("_temp.py", "w", encoding="utf-8") as f:
-            f.write(code)
-        inject(pid, "_temp.py")
-        os.remove("_temp.py")
+        with socket.socket() as s:
+            s.settimeout(3)
+            s.connect(('localhost', 2804))
+            s.sendall(f"{cmd}:{payload}".encode())
+            return s.recv(4096).decode()
     except Exception as e:
-        print(f"Error dumping {item}: {e}")
-
-
-def inspect_class_attributes(pid, data) -> None:
-    """Inspect attributes of a class instance."""
-    try:
-        code = """
-def inspect_class_attributes(class_obj: type, attribute_name: str) -> None:
-    try:
-        instance = class_obj()
-        print(f"Attributes of {class_obj.__name__}:")
-        print("Instance __dict__:", instance.__dict__)
-        print("Attribute value:", getattr(instance, attribute_name, "Not found"))
-    except Exception as e:
-        print(f"Inspection error: {e}")"""
-        code2 = f"""
-data = "{data}"
-if "." in data:
-    cls_name, attr = data.split(".", 1)
-    cls = load_module_contents()["classes"].get(cls_name)
-    if cls:
-        inspect_class_attributes(cls, attr)"""
-        with open("_temp.py", "w", encoding="utf-8") as f:
-            f.write(LOAD_STRUCTURE_CODE + code + code2)
-        inject(pid, "_temp.py")
-        os.remove("_temp.py")
-    except Exception as e:
-        print(f"Inspection error: {e}")
-
-
-def display_structure(pid) -> None:
-    """Display module structure or specific class methods, including variables."""
-    code = """
-def display_structure(contents: Dict, class_name: str = None) -> None:
-    root = Node("Module") if not class_name else Node(class_name)
-
-    if class_name:
-        cls = contents["classes"].get(class_name)
-        if not cls:
-            print("Class not found")
-            return
-        for name, _ in inspect.getmembers(cls, inspect.isfunction):
-            root.children.append(Node(name))
-    else:
-        for cls_name, cls in contents["classes"].items():
-            class_node = Node(cls_name)
-            for name, _ in inspect.getmembers(cls, inspect.isfunction):
-                class_node.children.append(Node(name))
-            root.children.append(class_node)
-        for func_name in contents["functions"]:
-            root.children.append(Node(func_name))
-        for var_name in contents["variables"]:
-            root.children.append(Node(f"{var_name} (variable)"))
-
-    print(format_tree(root, lambda x: x.name, lambda x: x.get_children()))
-
-
-contents = load_module_contents()
-display_structure(contents)
-"""
-    with open("_temp.py", "w", encoding="utf-8") as f:
-        f.write(LOAD_STRUCTURE_CODE + code)
-    inject(pid, "_temp.py")
-    os.remove("_temp.py")
-
+        return f"Connection error: {str(e)}"
 
 def scan_python_processes():
     """Scan for Python processes and display PID and filename."""
@@ -230,7 +282,6 @@ def scan_python_processes():
         if not found:
             print("No Python processes found.")
         print("-" * len(header))
-
     except subprocess.CalledProcessError as e:
         print(f"Error executing command: {e}")
         if os.name == "posix":
@@ -240,83 +291,74 @@ def scan_python_processes():
     except Exception as e:
         print(f"Unexpected error: {e}")
 
+def dbg_loop(pid):
+    """Main debugger loop"""
+    if not check_port():
+        print("Injecting server...")
+        inject_server(pid)
+        time.sleep(2)
+        
+        if not check_port():
+            print("Failed to start debug server")
+            return
 
-def get_variable(pid, var):
-    """get variable by name"""
-    code = f'\ncontents = load_module_contents()\nvar_name = "{var}"'
-    code1 = """
-var_value = contents["variables"].get(var_name)
-if var_value is not None:
-    print(f"{var_name}:")
-    print(f"  Type: {type(var_value).__name__}")
-    print(f"  Value: {repr(var_value)}")
-else:
-    print(f"Variable '{var_name}' not found in module")"""
-    with open("_temp.py", "w", encoding="utf-8") as f:
-        f.write(LOAD_STRUCTURE_CODE + code + code1)
-    inject(pid, "_temp.py")
-    os.remove("_temp.py")
-
-
-def get_all_variables(pid, var_type):
-    """get all variables by type"""
-    code1 = """
-variables = load_module_contents().get("variables", {})
-if not variables:
-    print("No variables found in module")
-else:"""
-    code2 = f"""
-    type_name = "{var_type}"
-"""
-    code3 = """
-    target_type = getattr(__builtins__, type_name, None)
-    if not target_type:
-        print(f"Error: Type '{type_name}' is not a valid built-in type.")
-    else:
-        found = False
-        print(f"Variables of type {type_name} in module:")
-        for var_name, var_value in variables.items():
-            if isinstance(var_value, target_type):
-                print(f"{var_name}:")
-                print(f"  Type: {type(var_value).__name__}")
-                print(f"  Value: {repr(var_value)}")
-                found = True
-        if not found:
-            print(f"No variables of type {type_name} found.")"""
-    with open("_temp.py", "w", encoding="utf-8") as f:
-        f.write(LOAD_STRUCTURE_CODE + code1 + code2 + code3)
-    inject(pid, "_temp.py")
-    os.remove("_temp.py")
-
-
-def dbg(pid):
-    """debugger function"""
+    print(f"Connected to process {pid}. Type 'help' for commands")
+    
     while True:
-        user_input = input("cynthetika-dbg > ").strip().split()
-        command = user_input[0].lower()
-        data = " ".join(user_input[1:]) if len(user_input) > 1 else ""
-        functions = {
-            "objects": lambda: display_structure(pid),
-            "dump": lambda: dump_bytecode(pid, data),
-            "dis": lambda: dis_bytecode(pid, data),
-            "get": lambda: get_variable(pid, data),
-            "objects-type": lambda: get_all_variables(pid, data),
-            "search": lambda: inspect_class_attributes(pid, data),
-            "rrun": lambda: inject(pid, data),
-            "help": lambda: print(HELPER),
-            "exit": exit,
-        }
-        if command in functions:
-            functions[command]()
+        try:
+            user_input = input("cynthetika-dbg> ").strip().split()
+            if not user_input:
+                continue
+                
+            cmd = user_input[0].lower()
+            args = ' '.join(user_input[1:])
+            
+            if cmd == 'exit':
+                break
+                
+            if cmd == 'help':
+                print(HELPER)
+                continue
+                
+            handlers = {
+                'objects': ('structure', ''),
+                'dump': ('dump', args),
+                'dis': ('dis', args),
+                'get': ('getvar', args),
+                'typevars': ('typevars', args),
+                'search': ('searchattr', args),
+                'rrun': ('exec', f'exec(open("{args}").read())' if args.endswith('.py') else args)
+            }
+            
+            if cmd not in handlers:
+                print(f"Unknown command: {cmd}")
+                continue
+                
+            server_cmd, payload = handlers[cmd]
+            response = send_command(server_cmd, payload)
+            print(response)
+            
+        except KeyboardInterrupt:
+            print("\nUse 'exit' to quit")
+        except Exception as e:
+            print(f"Error: {str(e)}")
 
-
-def main() -> None:
+def main():
     """main function"""
-    if sys.argv[1] == "-scan":
+    if len(sys.argv) < 2:
+        print("Usage:")
+        print("  dbg.py -scan  # Scan processes")
+        print("  dbg.py <PID>  # Attach to process")
+        return
+        
+    if sys.argv[1] == '-scan':
         scan_python_processes()
-    elif sys.argv[1] == "-dbg":
-        dbg(int(sys.argv[2]))
+    elif sys.argv[1] == '-dbg':
+        try:
+            pid = int(sys.argv[2])
+            dbg_loop(pid)
+        except ValueError:
+            print("Invalid PID")
 
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
